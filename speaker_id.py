@@ -28,7 +28,21 @@
 # python speaker_id.py --cfg=cfg/AM_MobileNet1D_TIMIT.cfg
 
 #
+"""
+Module speaker_id
+------------------
+Utilities and training script to run speaker identification experiments
+using MobileNet1D and an Additive Margin Softmax (AM-Softmax) loss.
 
+Main responsibilities:
+- create random training batches from audio files
+- define AM-Softmax loss wrapper
+- build and train a MobileNetV2 model using options from a config file
+
+Usage example:
+    python speaker_id.py --cfg=cfg/AM_MobileNet1D_TIMIT.cfg
+
+"""
 import os
 import torch, torchaudio
 import torch.nn as nn
@@ -41,60 +55,99 @@ from mobilenet1d import MobileNetV2
 from tqdm import tqdm
 
 def create_batches_rnd(batch_size,data_folder,wav_lst,N_snt,wlen,lab_dict,fact_amp):
-    
-    # Initialization of the minibatch (batch_size,[0=>x_t,1=>x_t+N,1=>random_samp])
-    #sig_batch_spec = np.zeros([batch_size, 1, 201, 17])
-    sig_batch=np.zeros([batch_size, 1, wlen])
-    lab_batch=np.zeros(batch_size)
+    """Create a random minibatch of fixed-length audio segments.
 
+    Each batch element is a randomly sampled contiguous segment of length
+    ``wlen`` taken from a randomly selected utterance in ``wav_lst``. A
+    small random amplitude scaling (data augmentation) is applied.
 
-    snt_id_arr=np.random.randint(N_snt, size=batch_size)
- 
-    rand_amp_arr = np.random.uniform(1.0-fact_amp,1+fact_amp,batch_size)
+    Args:
+        batch_size (int): number of examples in the batch.
+        data_folder (str): base path to audio files.
+        wav_lst (list): list of relative audio file paths.
+        N_snt (int): number of utterances in ``wav_lst``.
+        wlen (int): window length in samples.
+        lab_dict (dict): mapping from filename to integer label.
+        fact_amp (float): amplitude augmentation factor (fractional).
+
+    Returns:
+        inp (torch.Variable): Tensor on CUDA of shape (batch_size, 1, wlen).
+        lab (torch.Variable): Long tensor on CUDA of shape (batch_size,).
+    """
+
+    # initialize numpy containers for signals and labels
+    sig_batch = np.zeros([batch_size, 1, wlen])
+    lab_batch = np.zeros(batch_size)
+
+    # choose random utterance indices and random amplitude scale per example
+    snt_id_arr = np.random.randint(N_snt, size=batch_size)
+    rand_amp_arr = np.random.uniform(1.0 - fact_amp, 1 + fact_amp, batch_size)
 
     for i in range(batch_size):
+        # load waveform (shape: [channels, samples])
+        [signal, fs] = torchaudio.load(data_folder + wav_lst[snt_id_arr[i]])
 
-        [signal, fs] = torchaudio.load(data_folder+wav_lst[snt_id_arr[i]])   # reading with torchaudio
-        # -----
+        # pick a random contiguous segment of length `wlen`
+        snt_len = signal.shape[1]
+        snt_beg = np.random.randint(snt_len - wlen - 1)
+        snt_end = snt_beg + wlen
 
-        snt_len = signal.shape[1]       # when reading audio from torchaudio
-        snt_beg=np.random.randint(snt_len-wlen-1) #randint(0, snt_len-2*wlen-1)
-        snt_end=snt_beg+wlen
-  
-        sig_batch[i,:]= signal[:, snt_beg:snt_end]*rand_amp_arr[i]        # when reading with psoundfile
-        lab_batch[i]=lab_dict[wav_lst[snt_id_arr[i]]]
+        # store scaled audio and label index
+        sig_batch[i, :] = signal[:, snt_beg:snt_end] * rand_amp_arr[i]
+        lab_batch[i] = lab_dict[wav_lst[snt_id_arr[i]]]
 
+    # convert to torch tensors and move to GPU
+    inp = Variable(torch.from_numpy(sig_batch).float().cuda().contiguous())
+    lab = Variable(torch.from_numpy(lab_batch).float().cuda().contiguous())
 
-    inp=Variable(torch.from_numpy(sig_batch).float().cuda().contiguous())
-
-    lab= Variable(torch.from_numpy(lab_batch).float().cuda().contiguous())
-
-
-    return inp,lab
+    return inp, lab
 
 
 class AdditiveMarginSoftmax(nn.Module):
-    # AMSoftmax
+    """Additive Margin Softmax loss wrapper (AM-Softmax).
+
+    This module implements the AM-Softmax criterion as a loss function wrapper.
+    It expects the raw model outputs (logits-like cosine scores) in ``predicted``
+    and the integer class labels in ``target``.
+
+    Args:
+        margin (float): additive margin to subtract from the target logit.
+        s (float): scaling factor applied to logits before the softmax.
+    """
+
     def __init__(self, margin=0.35, s=30):
         super().__init__()
 
-        self.m = margin #
+        self.m = margin
         self.s = s
-        self.epsilon = 0.000000000001
+        self.epsilon = 1e-12
         print('AMSoftmax m = ' + str(margin))
 
     def forward(self, predicted, target):
+        """Compute the AM-Softmax loss.
 
-        # ------------ AM Softmax ------------ #
+        Args:
+            predicted (torch.Tensor): model outputs (shape: [num_classes, batch])
+            target (torch.Tensor): integer class labels (shape: [batch]).
+
+        Returns:
+            torch.Tensor: scalar loss value (mean over the batch).
+        """
+
+        # normalize predicted vectors and compute the target cosine
         predicted = predicted / (predicted.norm(p=2, dim=0) + self.epsilon)
         indexes = range(predicted.size(0))
         cos_theta_y = predicted[indexes, target]
+
+        # apply additive margin to the ground-truth logit
         cos_theta_y_m = cos_theta_y - self.m
         exp_s = np.e ** (self.s * cos_theta_y_m)
 
+        # compute denominator: sum over classes excluding the ground-truth class
         sum_cos_theta_j = (np.e ** (predicted * self.s)).sum(dim=1) - (np.e ** (predicted[indexes, target] * self.s))
 
-        log = -torch.log(exp_s/(exp_s+sum_cos_theta_j+self.epsilon)).mean()
+        # negative log-likelihood of the scaled and margin-adjusted target
+        log = -torch.log(exp_s / (exp_s + sum_cos_theta_j + self.epsilon)).mean()
 
         return log
 

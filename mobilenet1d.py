@@ -1,3 +1,20 @@
+"""
+mobilenet1d
+-----------
+Lightweight 1D MobileNetV2 implementation used for speaker-identification
+experiments. The file contains utility layers and the `MobileNetV2` class
+adapted to operate on 1D waveforms/features.
+
+Key components:
+- `_make_divisible`: helper to ensure channel counts are divisible by a value.
+- `LayerNorm`: small LayerNorm implementation for last-dimension normalization.
+- `ConvBNReLU`: convenience block with Conv1d -> BatchNorm1d -> ReLU6.
+- `InvertedResidual`: inverted residual block used by MobileNetV2.
+- `MobileNetV2`: model definition with configurable width multiplier.
+
+This module is used by `speaker_id.py` to create and train the model.
+"""
+
 from torch import nn
 import torch
 
@@ -21,19 +38,32 @@ def _make_divisible(v, divisor, min_value=None):
     return new_v
 
 class LayerNorm(nn.Module):
+    """Simple Layer Normalization over the last dimension.
+
+    This implementation mirrors a small, dependency-free LayerNorm that
+    normalizes across the last axis of the input tensor and applies learned
+    scale (`gamma`) and shift (`beta`) parameters.
+    """
 
     def __init__(self, features, eps=1e-6):
-        super(LayerNorm,self).__init__()
+        super(LayerNorm, self).__init__()
         self.gamma = nn.Parameter(torch.ones(features))
         self.beta = nn.Parameter(torch.zeros(features))
         self.eps = eps
 
     def forward(self, x):
+        # compute statistics on the last axis and apply affine transform
         mean = x.mean(-1, keepdim=True)
         std = x.std(-1, keepdim=True)
         return self.gamma * (x - mean) / (std + self.eps) + self.beta
 
 class ConvBNReLU(nn.Sequential):
+    """Convenience block: Conv1d -> BatchNorm1d -> ReLU6.
+
+    Uses same-padding calculation to preserve temporal size when
+    `stride == 1`.
+    """
+
     def __init__(self, in_planes, out_planes, kernel_size=3, stride=1, groups=1):
         padding = (kernel_size - 1) // 2
         super(ConvBNReLU, self).__init__(
@@ -55,9 +85,11 @@ class InvertedResidual(nn.Module):
         layers = []
         if expand_ratio != 1:
             # pw
+            # pointwise conv to expand channels
             layers.append(ConvBNReLU(inp, hidden_dim, kernel_size=1))
         layers.extend([
             # dw
+            # depthwise convolution operates independently on each channel
             ConvBNReLU(hidden_dim, hidden_dim, stride=stride, groups=hidden_dim),
             # pw-linear
             nn.Conv1d(hidden_dim, oup, 1, 1, 0, bias=False),
@@ -66,6 +98,7 @@ class InvertedResidual(nn.Module):
         self.conv = nn.Sequential(*layers)
 
     def forward(self, x):
+        # residual connection when input and output shapes match
         if self.use_res_connect:
             return x + self.conv(x)
         else:
@@ -109,6 +142,7 @@ class MobileNetV2(nn.Module):
         # building first layer
         input_channel = _make_divisible(input_channel * width_mult, round_nearest)
         self.last_channel = _make_divisible(last_channel * max(1.0, width_mult), round_nearest)
+        # first convolution expects a single-channel (1D waveform) input
         features = [ConvBNReLU(1, input_channel, stride=2)]
         # building inverted residual blocks
         for t, c, n, s in inverted_residual_setting:
@@ -148,14 +182,18 @@ class MobileNetV2(nn.Module):
 
     def forward(self, x):
 
-        if(len(x.shape) ==2):
+        # If the input is provided as (batch, time) reshape and normalize it.
+        # Expected model input shape is (batch, channels=1, time).
+        if (len(x.shape) == 2):
             x = self.normalize(x)
             x = x.reshape([x.shape[0], 1, x.shape[1]])
             x = self.maxpool1d(x)
 
-
+        # apply feature extractor then global average pooling over time
         x = self.features(x)
         x = x.mean(2)
+
+        # classifier produces log-probabilities
         x = self.classifier(x)
         return x
 
